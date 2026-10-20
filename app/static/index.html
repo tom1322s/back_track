@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>back_track</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<header>
+  <h1>back_track</h1>
+  <p class="sub">upload a song &rarr; split stems &rarr; practice</p>
+</header>
+
+<section id="upload-pane" class="pane">
+  <input type="file" id="file-input" accept="audio/*" />
+  <button id="upload-btn">Upload &amp; separate</button>
+  <div id="upload-status"></div>
+  <div id="library"></div>
+</section>
+
+<section id="player-pane" class="pane hidden">
+  <h2 id="track-name"></h2>
+
+  <div class="transport">
+    <button id="play-btn">Play</button>
+    <button id="stop-btn">Stop</button>
+    <span id="time-display">0:00 / 0:00</span>
+  </div>
+
+  <div class="chord-display">
+    <div class="chord-bar current" id="chord-now">
+      <div class="chord-bar-label">NOW</div>
+      <div class="chord-slots"></div>
+    </div>
+    <div class="chord-bar next" id="chord-next">
+      <div class="chord-bar-label">NEXT</div>
+      <div class="chord-slots"></div>
+    </div>
+  </div>
+
+  <div class="key-display">
+    Key: <span id="key-value">–</span>
+    <span class="transpose-ctrl">
+      <button id="semi-down" class="semi-btn">−</button>
+      <span id="semi-val">0</span>
+      <button id="semi-up" class="semi-btn">+</button>
+    </span>
+    <span id="transpose-status"></span>
+  </div>
+
+  <div class="tracks" id="tracks"></div>
+
+  <div class="controls">
+    <div class="control bpm">
+      <div class="row">
+        <label>Original BPM <span id="orig-bpm">–</span></label>
+        <label>Target BPM <input type="number" id="target-bpm" min="30" max="300" step="1" /></label>
+        <span id="speed-val" class="muted-text">1.00x</span>
+        <label class="inline"><input type="checkbox" id="preserve-pitch" checked /> preserve pitch</label>
+      </div>
+    </div>
+
+    <div class="control metronome">
+      <div class="row">
+        <label>Metronome</label>
+        <button id="metro-toggle">Off</button>
+        <label>Beats/bar <input type="number" id="metro-beats" value="4" min="1" max="12" /></label>
+        <small>Locked to the song's beat grid &mdash; moves with speed changes.</small>
+      </div>
+    </div>
+  </div>
+
+  <button id="back-btn">&larr; back to library</button>
+</section>
+
+<script src="/app.js"></script>
+</body>
+</html>
