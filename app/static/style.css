@@ -98,10 +98,13 @@ input[type="number"] { width: 70px; }
   background: #0e2238;
   border-radius: 6px;
   display: flex; align-items: center; justify-content: center;
-  color: #e8ecf2; font-size: 36px; font-weight: 700;
-  letter-spacing: 1px;
+  color: #e8ecf2; font-size: clamp(16px, 3.2vw, 32px); font-weight: 700;
+  letter-spacing: 0.5px;
   min-width: 0;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  padding: 0 2px;
 }
+.chord-slot.nc { color: var(--muted); font-size: 16px; font-weight: 500; background: #0c1a2c; }
 .chord-slot.empty { background: transparent; border: 1px dashed var(--border); color: var(--muted); font-size: 14px; }
 .chord-bar.current .chord-slot.active { background: var(--accent); color: #0f1115; }
 

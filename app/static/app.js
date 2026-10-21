@@ -20,6 +20,7 @@ const speedVal = document.getElementById("speed-val");
 const preservePitch = document.getElementById("preserve-pitch");
 const metroToggle = document.getElementById("metro-toggle");
 const metroBeats = document.getElementById("metro-beats");
+const downbeatShift = document.getElementById("downbeat-shift");
 const backBtn = document.getElementById("back-btn");
 const semiUp = document.getElementById("semi-up");
 const semiDown = document.getElementById("semi-down");
@@ -54,6 +55,9 @@ let keyName = null;
 let metroOn = false;
 let currentJobId = null;
 let semitones = 0;
+let blobUrls = {};        // stem -> object URL for transposed audio
+let beatAnchor = 0;       // index in allBeatTimes() of the first detected beat
+let downbeatOffset = 0;   // user nudge for which beat is the "1"
 let _cachedBeats = null;
 let _cachedBeatsDur = -1;
 
@@ -144,6 +148,9 @@ function teardown() {
   nextBeatToSchedule = 0; scheduledClicks = [];
   currentJobId = null; semitones = 0; semiVal.textContent = "0";
   transposeStatus.textContent = "";
+  for (const u of Object.values(blobUrls)) URL.revokeObjectURL(u);
+  blobUrls = {};
+  beatAnchor = 0; downbeatOffset = 0;
   _cachedBeats = null; _cachedBeatsDur = -1;
   if (ctx) { ctx.close(); ctx = null; }
 }
@@ -328,11 +335,10 @@ function drawMetroGrid() {
   c.clearRect(0, 0, w, h);
   const dur = audios[STEMS[0]] && audios[STEMS[0]].duration;
   if (!dur) return;
-  const beatsPerBar = Math.max(1, parseInt(metroBeats.value, 10) || 4);
   const times = allBeatTimes(dur);
   for (let n = 0; n < times.length; n++) {
     const x = (times[n] / dur) * w;
-    const isDown = n % beatsPerBar === 0;
+    const isDown = beatPhase(n) === 0;
     c.fillStyle = isDown ? "#0a2140" : "rgba(10,33,64,0.55)";
     const barH = isDown ? h : h * 0.55;
     c.fillRect(x, h - barH, isDown ? 2 : 1, barH);
@@ -340,6 +346,8 @@ function drawMetroGrid() {
 }
 
 // Beat times across the whole track — extrapolated backward to 0 and forward to dur.
+// Also sets beatAnchor to the index of the first *detected* beat, so the downbeat
+// phase stays tied to detection and isn't thrown off by the prepended beats.
 function allBeatTimes(dur) {
   if (!dur) return [];
   if (_cachedBeats && _cachedBeatsDur === dur) return _cachedBeats;
@@ -349,22 +357,37 @@ function allBeatTimes(dur) {
     for (let i = 1; i < beatTimes.length; i++) gaps.push(beatTimes[i] - beatTimes[i - 1]);
     gaps.sort((a, b) => a - b);
     const gap = gaps[Math.floor(gaps.length / 2)];
-    // Backward.
     const pre = [];
     for (let t = beatTimes[0] - gap; t >= 0; t -= gap) pre.push(t);
     pre.reverse();
+    beatAnchor = pre.length;
     out.push(...pre, ...beatTimes);
-    // Forward.
     for (let t = beatTimes[beatTimes.length - 1] + gap; t <= dur; t += gap) out.push(t);
   } else if (originalBpm) {
     const gap = 60 / originalBpm;
     let t = beatOffset % gap;
     if (t < 0) t += gap;
-    for (; t <= dur; t += gap) out.push(t);
+    let anchorSet = false;
+    for (; t <= dur; t += gap) {
+      if (!anchorSet && t >= beatOffset - 1e-6) { beatAnchor = out.length; anchorSet = true; }
+      out.push(t);
+    }
+  } else {
+    beatAnchor = 0;
   }
   _cachedBeats = out;
   _cachedBeatsDur = dur;
   return out;
+}
+
+function currentBeatsPerBar() {
+  return Math.max(1, parseInt(metroBeats.value, 10) || 4);
+}
+
+// Phase of beat index i within the bar: 0 = downbeat (the "1").
+function beatPhase(i) {
+  const bpb = currentBeatsPerBar();
+  return (((i - beatAnchor - downbeatOffset) % bpb) + bpb) % bpb;
 }
 
 // ---------- Transport ----------
@@ -427,7 +450,6 @@ function metroScheduler() {
   if (!lead || lead.paused || !ctx) return;
   const times = allBeatTimes(lead.duration);
   if (!times.length) return;
-  const beatsPerBar = Math.max(1, parseInt(metroBeats.value, 10) || 4);
   const rate = lead.playbackRate || 1;
   const nowSong = lead.currentTime;
   const nowWall = ctx.currentTime;
@@ -439,7 +461,7 @@ function metroScheduler() {
   while (nextBeatToSchedule < times.length && times[nextBeatToSchedule] <= horizonSong) {
     const beatTime = times[nextBeatToSchedule];
     const whenWall = nowWall + Math.max(0, (beatTime - nowSong) / rate);
-    scheduleClickAt(whenWall, nextBeatToSchedule % beatsPerBar === 0);
+    scheduleClickAt(whenWall, beatPhase(nextBeatToSchedule) === 0);
     nextBeatToSchedule++;
   }
   // Reap finished entries.
@@ -521,7 +543,7 @@ function audibleTime() {
 function currentBarRange() {
   const lead = audios[STEMS[0]];
   if (!lead || !lead.duration) return null;
-  const beatsPerBar = Math.max(1, parseInt(metroBeats.value, 10) || 4);
+  const bpb = currentBeatsPerBar();
   const times = allBeatTimes(lead.duration);
   if (times.length < 2) return null;
   // Find beat index we're currently on, using the audible time.
@@ -530,15 +552,12 @@ function currentBarRange() {
   for (let i = 0; i < times.length; i++) {
     if (times[i] <= t) idx = i; else break;
   }
-  const barIdx = Math.floor(idx / beatsPerBar);
-  const barStartBeat = barIdx * beatsPerBar;
-  const barEndBeat = barStartBeat + beatsPerBar;
-  const start = times[barStartBeat];
-  const end = times[Math.min(barEndBeat, times.length - 1)] +
-              (barEndBeat >= times.length ? 0 : 0);
-  // For the last bar, extend to track end.
+  // Walk back to this bar's downbeat so bars line up with the "1".
+  const barStartBeat = idx - beatPhase(idx);
+  const barEndBeat = barStartBeat + bpb;
+  const start = times[Math.max(0, barStartBeat)];
   const safeEnd = barEndBeat >= times.length ? lead.duration : times[barEndBeat];
-  return { start, end: safeEnd, barIdx };
+  return { start, end: safeEnd, barStartBeat };
 }
 
 function chordsInRange(start, end) {
@@ -590,6 +609,7 @@ function renderChordBar(el, slots, highlightTime) {
   for (const s of slots) {
     const slot = document.createElement("div");
     slot.className = "chord-slot";
+    if (s.name === "N.C.") slot.classList.add("nc");
     slot.style.flex = s.span.toFixed(3);
     slot.textContent = shiftChord(s.name, semitones);
     if (highlightTime !== null && highlightTime >= s.start - 0.01 &&
@@ -608,10 +628,10 @@ function updateChordBars() {
   const nowSlots = chordsInRange(bar.start, bar.end);
   renderChordBar(chordNowEl, nowSlots, audibleTime());
 
-  const beatsPerBar = Math.max(1, parseInt(metroBeats.value, 10) || 4);
+  const bpb = currentBeatsPerBar();
   const times = allBeatTimes(lead.duration);
-  const nextStartBeat = (bar.barIdx + 1) * beatsPerBar;
-  const nextEndBeat = nextStartBeat + beatsPerBar;
+  const nextStartBeat = bar.barStartBeat + bpb;
+  const nextEndBeat = nextStartBeat + bpb;
   if (nextStartBeat >= times.length) {
     renderChordBar(chordNextEl, [], null);
     return;
@@ -644,6 +664,12 @@ preservePitch.onchange = () => {
 };
 
 metroBeats.oninput = () => { drawMetroGrid(); updateChordBars(); };
+
+downbeatShift.onclick = () => {
+  downbeatOffset = (downbeatOffset + 1) % currentBeatsPerBar();
+  drawMetroGrid();
+  updateChordBars();
+};
 
 backBtn.onclick = () => {
   teardown();
@@ -693,19 +719,26 @@ async function swapStemSources() {
   const lead = audios[STEMS[0]];
   const wasPlaying = !lead.paused;
   const t = lead.currentTime;
-  for (const stem of STEMS) {
-    audios[stem].pause();
+  for (const stem of STEMS) audios[stem].pause();
+  // Load each shifted stem as a blob so the element holds the whole file:
+  // a blob URL is fully seekable with a known duration (streaming over HTTP
+  // range requests was leaving the swapped source stuck at 0:00).
+  await Promise.all(STEMS.map(async stem => {
     const q = semitones ? `?semitones=${semitones}` : "";
-    audios[stem].src = `/api/stems/${currentJobId}/${stem}${q}`;
+    const resp = await fetch(`/api/stems/${currentJobId}/${stem}${q}`);
+    const blob = await resp.blob();
+    if (blobUrls[stem]) URL.revokeObjectURL(blobUrls[stem]);
+    blobUrls[stem] = URL.createObjectURL(blob);
+    audios[stem].src = blobUrls[stem];
     audios[stem].load();
-  }
+  }));
   await Promise.all(STEMS.map(s => new Promise(res => {
-    audios[s].addEventListener("canplay", res, { once: true });
+    if (audios[s].readyState >= 1 && audios[s].duration) return res();
+    audios[s].addEventListener("loadedmetadata", res, { once: true });
   })));
   for (const stem of STEMS) audios[stem].currentTime = t;
-  if (wasPlaying) {
-    await Promise.all(STEMS.map(s => audios[s].play()));
-  }
+  resetMetroScheduler();
+  if (wasPlaying) await Promise.all(STEMS.map(s => audios[s].play()));
 }
 
 semiUp.onclick = () => requestTranspose(+1);

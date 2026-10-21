@@ -76,40 +76,111 @@ def _estimate_key(chroma):
     return best
 
 
-def _match_chords_per_beat(chord_frames):
+# ---- BTC transformer chord recognition (primary) ----
+
+_btc_model = None
+
+# Harte quality → guitar-friendly suffix.
+HARTE_SUFFIX = {
+    "maj": "", "": "", "min": "m", "dim": "dim", "aug": "aug",
+    "maj7": "maj7", "min7": "m7", "7": "7", "dim7": "dim7",
+    "hdim7": "m7b5", "minmaj7": "mM7",
+    "maj6": "6", "6": "6", "min6": "m6",
+    "9": "9", "maj9": "maj9", "min9": "m9",
+    "sus2": "sus2", "sus4": "sus4", "11": "11", "13": "13",
+}
+FLAT_TO_SHARP = {"Db": "C#", "Eb": "D#", "Gb": "F#", "Ab": "G#",
+                 "Bb": "A#", "Cb": "B", "Fb": "E"}
+
+
+def _harte_to_display(chord: str) -> str:
+    if not chord or chord == "N":
+        return "N.C."
+    root, _, qual = chord.partition(":")
+    qual = qual.split("/")[0]            # drop inversion (e.g. maj/3)
+    root = FLAT_TO_SHARP.get(root, root)
+    suffix = HARTE_SUFFIX.get(qual, qual)
+    return root + suffix
+
+
+def _get_btc():
+    global _btc_model
+    if _btc_model is None:
+        from transformers import AutoModel
+        _btc_model = AutoModel.from_pretrained(
+            "puar-playground/btc-chord", trust_remote_code=True)
+    return _btc_model
+
+
+def _detect_chords_btc(audio_path: Path):
+    model = _get_btc()
+    raw = model.predict(str(audio_path))   # [{start, end, chord}] in Harte notation
+    out = []
+    for seg in raw:
+        out.append({
+            "start": round(float(seg["start"]), 3),
+            "end": round(float(seg["end"]), 3),
+            "name": _harte_to_display(seg["chord"]),
+        })
+    return _merge_short(out, 0.3)
+
+
+def _detect_chords(y_harm, sr, min_dur=0.45):
+    """Frame-level chord detection with Viterbi smoothing → true-time segments."""
     import numpy as np
-    from scipy.ndimage import median_filter
+    import librosa
+
+    hop = 2048
+    # Use the harmonic component so percussion doesn't smear the chroma.
+    y_h = librosa.effects.harmonic(y_harm, margin=4)
+    chroma = librosa.feature.chroma_cqt(y=y_h, sr=sr, hop_length=hop)
+    frame_times = librosa.frames_to_time(
+        np.arange(chroma.shape[1] + 1), sr=sr, hop_length=hop)
+
     templates, names = _chord_templates()
-    frames = chord_frames / (np.linalg.norm(chord_frames, axis=0, keepdims=True) + 1e-9)
+    frames = chroma / (np.linalg.norm(chroma, axis=0, keepdims=True) + 1e-9)
     templates_n = templates / (np.linalg.norm(templates, axis=1, keepdims=True) + 1e-9)
-    scores = templates_n @ frames
-    idx = scores.argmax(axis=0)
-    if len(idx) >= 5:
-        idx = median_filter(idx, size=5)
-    return [names[int(i)] for i in idx]
+    sim = templates_n @ frames                      # (n_chords, n_frames), cosine-ish
+    emission = np.clip(sim, 1e-6, None)
+    emission = emission / emission.sum(axis=0, keepdims=True)
+
+    n = len(names)
+    p_self = 0.92                                    # bias toward holding a chord
+    trans = np.full((n, n), (1.0 - p_self) / (n - 1))
+    np.fill_diagonal(trans, p_self)
+    path = librosa.sequence.viterbi(emission, trans)
+
+    segs = []
+    cur, start_i = int(path[0]), 0
+    for i in range(1, len(path)):
+        if int(path[i]) != cur:
+            segs.append({"start": float(frame_times[start_i]),
+                         "end": float(frame_times[i]), "name": names[cur]})
+            cur, start_i = int(path[i]), i
+    segs.append({"start": float(frame_times[start_i]),
+                 "end": float(frame_times[len(path)]), "name": names[cur]})
+    return _merge_short(segs, min_dur)
 
 
-def _group_chords(per_beat, beat_times):
-    if not per_beat or not beat_times:
-        return []
-    if len(beat_times) >= 2:
-        gaps = [beat_times[i + 1] - beat_times[i] for i in range(len(beat_times) - 1)]
-        gaps.sort()
-        median_gap = gaps[len(gaps) // 2]
-    else:
-        median_gap = 0.5
-    ends = list(beat_times[1:]) + [beat_times[-1] + median_gap]
-    out, cur, cur_start = [], per_beat[0], beat_times[0]
-    for i in range(1, len(per_beat)):
-        if per_beat[i] != cur:
-            out.append({"start": round(cur_start, 3), "end": round(ends[i - 1], 3), "name": cur})
-            cur, cur_start = per_beat[i], beat_times[i]
-    out.append({"start": round(cur_start, 3), "end": round(ends[-1], 3), "name": cur})
+def _merge_short(segs, min_dur):
+    """Fold sub-min_dur flickers into their neighbour, and merge same-name runs."""
+    out = []
+    for s in segs:
+        if out and (out[-1]["name"] == s["name"]):
+            out[-1]["end"] = s["end"]
+        elif out and (s["end"] - s["start"]) < min_dur:
+            out[-1]["end"] = s["end"]            # absorb the flicker
+        else:
+            out.append(dict(s))
+    for s in out:
+        s["start"] = round(s["start"], 3)
+        s["end"] = round(s["end"], 3)
     return out
 
 
-def _analyze_audio(stems_dir: Path) -> dict:
-    """Estimate tempo, beats, key, and per-bar chord labels from the separated stems."""
+def _analyze_audio(stems_dir: Path, source: Path | None = None) -> dict:
+    """Estimate tempo, beats, key, and chord labels. Chords come from the BTC
+    transformer on the original mix; tempo/key stay on the separated stems."""
     try:
         import librosa
         import numpy as np
@@ -118,7 +189,7 @@ def _analyze_audio(stems_dir: Path) -> dict:
         y_drums, _ = librosa.load(str(stems_dir / "drums.wav"), mono=True, sr=sr)
         y_other, _ = librosa.load(str(stems_dir / "other.wav"), mono=True, sr=sr)
         y_bass, _ = librosa.load(str(stems_dir / "bass.wav"), mono=True, sr=sr)
-        y_harm = y_other + 0.7 * y_bass  # harmonic mix for key/chord analysis
+        y_harm = y_other + 0.7 * y_bass  # harmonic mix for key analysis
 
         tempo, beats = librosa.beat.beat_track(y=y_drums, sr=sr)
         beat_times = librosa.frames_to_time(beats, sr=sr).tolist()
@@ -127,19 +198,18 @@ def _analyze_audio(stems_dir: Path) -> dict:
 
         chroma = librosa.feature.chroma_cqt(y=y_harm, sr=sr)
         key = _estimate_key(chroma)
-
-        if len(beats) >= 2:
-            per_beat_chroma = librosa.util.sync(chroma, beats, aggregate=np.median)
-            per_beat = _match_chords_per_beat(per_beat_chroma)
-            chords = _group_chords(per_beat, beat_times)
-        else:
-            chords = []
-
-        # Extend first/last chord to cover the whole track so there's always a label.
         duration = float(len(y_harm)) / sr
-        if chords:
-            chords[0]["start"] = 0.0
-            chords[-1]["end"] = round(duration, 3)
+
+        # Chords: BTC transformer on the full mix; template method as fallback.
+        chord_engine = "btc"
+        try:
+            chords = _detect_chords_btc(source if source else stems_dir / "other.wav")
+        except Exception as e:
+            chord_engine = f"template (btc failed: {e})"
+            chords = _detect_chords(y_harm, sr)
+            if chords:
+                chords[0]["start"] = 0.0
+                chords[-1]["end"] = round(duration, 3)
 
         return {
             "bpm": round(bpm_val, 2),
@@ -148,6 +218,7 @@ def _analyze_audio(stems_dir: Path) -> dict:
             "beats": [round(t, 4) for t in beat_times],
             "key": key,
             "chords": chords,
+            "chord_engine": chord_engine,
         }
     except Exception as e:
         return {"bpm": None, "offset": 0.0, "beats": [], "key": None, "chords": [], "error": str(e)}
@@ -175,7 +246,7 @@ def _run_demucs(job_id: str, src: Path) -> None:
         for stem_file in stem_files:
             shutil.move(str(stem_file), str(work / stem_file.name))
         shutil.rmtree(model_dir, ignore_errors=True)
-        meta = _analyze_audio(work)
+        meta = _analyze_audio(work, src)
         (work / "meta.json").write_text(json.dumps(meta))
         with jobs_lock:
             jobs[job_id]["status"] = "done"
